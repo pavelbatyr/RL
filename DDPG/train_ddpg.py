@@ -27,6 +27,7 @@ LEARNING_RATE = 1e-4
 REPLAY_SIZE = 100_000
 REPLAY_START_SIZE = 10000
 TEST_ITERS = 1000
+MAX_FRAMES = 5_000_000
 
 
 def test_net(net, env, count=10, device="cpu"):
@@ -93,12 +94,10 @@ if __name__ == "__main__":
     act_opt = optim.Adam(act_net.parameters(), lr=LEARNING_RATE)
     crt_opt = optim.Adam(crt_net.parameters(), lr=LEARNING_RATE)
 
-    frame_idx = 0
     best_reward = None
     with RewardTracker(writer) as tracker:
         with TBMeanTracker(writer, batch_size=10) as tb_tracker:
-            while True:
-                frame_idx += 1
+            for frame_idx in range(1, MAX_FRAMES+1):
                 buffer.populate(1)
                 rewards_steps = exp_source.pop_rewards_steps()
                 if rewards_steps:
