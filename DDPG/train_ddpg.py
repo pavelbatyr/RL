@@ -17,20 +17,15 @@ import wrappers
 import model
 from agent import float32_preprocessor, AgentDDPG, TargetNet
 import experience
+from utils import TBMeanTracker, RewardTracker
 
 
 ENV_NAME = "MinitaurBulletEnv-v0"
-# STOP_REWARD = 19.5
-
-# REWARD_STEPS_DEFAULT = 2  # number of steps to unroll Bellman
-# DOUBLE_DQN = True
 GAMMA = 0.99
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 REPLAY_SIZE = 100_000
 REPLAY_START_SIZE = 10000
-SYNC_TARGET_FRAMES = 1000
-
 TEST_ITERS = 1000
 
 
@@ -51,94 +46,6 @@ def test_net(net, env, count=10, device="cpu"):
                 break
     return rewards / count, steps / count
 
-
-class TBMeanTracker:
-    """
-    TensorBoard value tracker: allows to batch fixed amount of historical values and write their mean into TB
-    Designed and tested with pytorch-tensorboard in mind
-    """
-    def __init__(self, writer, batch_size):
-        """
-        :param writer: writer with close() and add_scalar() methods
-        :param batch_size: integer size of batch to track
-        """
-        assert isinstance(batch_size, int)
-        assert writer is not None
-        self.writer = writer
-        self.batch_size = batch_size
-
-    def __enter__(self):
-        self._batches = collections.defaultdict(list)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.writer.close()
-
-    @staticmethod
-    def _as_float(value):
-        assert isinstance(value, (float, int, np.ndarray, np.generic, torch.autograd.Variable)) or torch.is_tensor(value)
-        tensor_val = None
-        if isinstance(value, torch.autograd.Variable):
-            tensor_val = value.data
-        elif torch.is_tensor(value):
-            tensor_val = value
-
-        if tensor_val is not None:
-            return tensor_val.float().mean().item()
-        elif isinstance(value, np.ndarray):
-            return float(np.mean(value))
-        else:
-            return float(value)
-
-    def track(self, param_name, value, iter_index):
-        assert isinstance(param_name, str)
-        assert isinstance(iter_index, int)
-
-        data = self._batches[param_name]
-        data.append(self._as_float(value))
-
-        if len(data) >= self.batch_size:
-            self.writer.add_scalar(param_name, np.mean(data), iter_index)
-            data.clear()
-
-
-class RewardTracker:
-    def __init__(self, writer, min_ts_diff=1.0):
-        """
-        Constructs RewardTracker
-        :param writer: writer to use for writing stats
-        :param min_ts_diff: minimal time difference to track speed
-        """
-        self.writer = writer
-        self.min_ts_diff = min_ts_diff
-
-    def __enter__(self):
-        self.ts = time.time()
-        self.ts_frame = 0
-        self.total_rewards = []
-        return self
-
-    def __exit__(self, *args):
-        self.writer.close()
-
-    def reward(self, reward, frame, epsilon=None):
-        self.total_rewards.append(reward)
-        mean_reward = np.mean(self.total_rewards[-100:])
-        ts_diff = time.time() - self.ts
-        if ts_diff > self.min_ts_diff:
-            speed = (frame - self.ts_frame) / ts_diff
-            self.ts_frame = frame
-            self.ts = time.time()
-            epsilon_str = "" if epsilon is None else ", eps %.2f" % epsilon
-            print("%d: done %d episodes, mean reward %.3f, speed %.2f f/s%s" % (
-                frame, len(self.total_rewards), mean_reward, speed, epsilon_str
-            ), flush=True)
-            self.writer.add_scalar("speed", speed, frame)
-        if epsilon is not None:
-            self.writer.add_scalar("epsilon", epsilon, frame)
-        self.writer.add_scalar("reward_100", mean_reward, frame)
-        self.writer.add_scalar("reward", reward, frame)
-        return mean_reward if len(self.total_rewards) > 30 else None
 
 def unpack_batch_ddqn(batch, device="cpu"):
     states, actions, rewards, dones, last_states = [], [], [], [], []
@@ -161,8 +68,6 @@ def unpack_batch_ddqn(batch, device="cpu"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # parser.add_argument("--reward", type=float, default=STOP_REWARD,
-    #                     help="Mean reward boundary for stop of training, default=%.2f" % STOP_REWARD)
     args = parser.parse_args()
     device = torch.device("cuda")
 
@@ -212,7 +117,8 @@ if __name__ == "__main__":
                 last_act_v = tgt_act_net.target_model(last_states_v)
                 q_last_v = tgt_crt_net.target_model(last_states_v, last_act_v)
                 q_last_v[dones_mask] = 0.0
-                q_ref_v = rewards_v.unsqueeze(dim=-1) + q_last_v * GAMMA
+                # computes target Q-value using 1-step Bellman equation:
+                q_ref_v = rewards_v.unsqueeze(-1) + q_last_v * GAMMA
                 critic_loss_v = F.mse_loss(q_v, q_ref_v.detach())
                 critic_loss_v.backward()
                 crt_opt.step()
@@ -223,8 +129,7 @@ if __name__ == "__main__":
                 act_opt.zero_grad()
                 cur_actions_v = act_net(states_v)
                 actor_loss_v = -crt_net(states_v, cur_actions_v)
-                actor_loss_v = actor_loss_v.mean()
-                actor_loss_v.backward()
+                actor_loss_v.mean().backward()
                 act_opt.step()
                 tb_tracker.track("loss_actor", actor_loss_v, frame_idx)
 
@@ -243,5 +148,5 @@ if __name__ == "__main__":
                             print("Best reward updated: %.3f -> %.3f" % (best_reward, rewards))
                             name = "best_%+.3f_%d.pt" % (rewards, frame_idx)
                             fname = os.path.join(save_path, name)
-                            torch.save(act_net.state_dict(), fname) #run_name + "-best.pt"
+                            torch.save(act_net.state_dict(), fname)
                         best_reward = rewards
