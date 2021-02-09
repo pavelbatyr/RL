@@ -28,7 +28,7 @@ class AgentDDPG:
         """
         return None
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def __call__(self, states, agent_states):
         states_v = float32_preprocessor(states).to(self.device)
         mu_v = self.net(states_v)
