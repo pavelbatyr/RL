@@ -181,46 +181,44 @@ class ExperienceSourceFirstLast(ExperienceSource):
                                       reward=total_reward, last_state=last_state)
 
 
-class ExperienceReplayBuffer:
-    def __init__(self, experience_source, buffer_size):
-        assert isinstance(experience_source, (ExperienceSource, type(None)))
-        assert isinstance(buffer_size, int)
-        self.experience_source_iter = None if experience_source is None else iter(experience_source)
-        self.buffer = []
-        self.capacity = buffer_size
+class PrioritizedReplayBuffer:
+    def __init__(self, exp_source, buf_size, prob_alpha=0.6):
+        self.exp_source_iter = iter(exp_source)
+        self.prob_alpha = prob_alpha
+        self.capacity = buf_size
         self.pos = 0
+        self.buffer = []
+        self.priorities = np.zeros((buf_size, ), dtype=np.float32)
 
     def __len__(self):
         return len(self.buffer)
 
-    def __iter__(self):
-        return iter(self.buffer)
+    def populate(self, count):
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        for _ in range(count):
+            sample = next(self.exp_source_iter)
+            if len(self.buffer) < self.capacity:
+                self.buffer.append(sample)
+            else:
+                self.buffer[self.pos] = sample
+            self.priorities[self.pos] = max_prio
+            self.pos = (self.pos + 1) % self.capacity
 
-    def sample(self, batch_size):
-        """
-        Get one random batch from experience replay
-        TODO: implement sampling order policy
-        :param batch_size:
-        :return:
-        """
-        if len(self.buffer) <= batch_size:
-            return self.buffer
-        # Warning: replace=False makes random.choice O(n)
-        keys = np.random.choice(len(self.buffer), batch_size, replace=True)
-        return [self.buffer[key] for key in keys]
-
-    def _add(self, sample):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(sample)
+    def sample(self, batch_size, beta=0.4):
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
         else:
-            self.buffer[self.pos] = sample
-        self.pos = (self.pos + 1) % self.capacity
+            prios = self.priorities[:self.pos]
+        probs = prios ** self.prob_alpha
 
-    def populate(self, samples):
-        """
-        Populates samples into the buffer
-        :param samples: how many samples to populate
-        """
-        for _ in range(samples):
-            entry = next(self.experience_source_iter)
-            self._add(entry)
+        probs /= probs.sum()
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        return samples, indices, np.array(weights, dtype=np.float32)
+
+    def update_priorities(self, batch_indices, batch_priorities):
+        for idx, prio in zip(batch_indices, batch_priorities):
+            self.priorities[idx] = prio

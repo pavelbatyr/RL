@@ -1,9 +1,9 @@
 import argparse
 import time
-import numpy as np
 import collections
 import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,6 +22,11 @@ STOP_REWARD = 19.5
 
 REWARD_STEPS_DEFAULT = 2  # number of steps to unroll Bellman
 DOUBLE_DQN = True
+
+PRIO_REPLAY_ALPHA = 0.6
+BETA_START = 0.4
+BETA_FRAMES = 100_000
+
 GAMMA = 0.99
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
@@ -85,14 +90,15 @@ def unpack_batch(batch):
            np.array(dones, dtype=bool), np.array(last_states, copy=False)
 
 
-def calc_loss_dqn(batch, net, tgt_net, gamma, device="cpu", double=True):
+def calc_loss(batch, batch_weights, net, tgt_net, gamma, device="cpu", double=True):
     states, actions, rewards, dones, next_states = unpack_batch(batch)
 
     states_v = torch.tensor(states, dtype=torch.float).to(device)
-    next_states_v = torch.tensor(next_states, dtype=torch.float).to(device)
+    next_states_v = torch.tensor(next_states).to(device)
     actions_v = torch.tensor(actions).to(device)
     rewards_v = torch.tensor(rewards).to(device)
     done_mask = torch.tensor(dones, dtype=torch.bool).to(device)
+    batch_weights_v = torch.tensor(batch_weights).to(device)
 
     state_action_values = net(states_v).gather(1, actions_v.unsqueeze(-1)).squeeze(-1)
     if double:
@@ -103,7 +109,8 @@ def calc_loss_dqn(batch, net, tgt_net, gamma, device="cpu", double=True):
     next_state_values[done_mask] = 0.0
 
     expected_state_action_values = next_state_values.detach() * gamma + rewards_v
-    return nn.MSELoss()(state_action_values, expected_state_action_values)
+    losses_v = batch_weights_v * (state_action_values - expected_state_action_values) ** 2
+    return losses_v.mean(), losses_v + 1e-5
 
 
 if __name__ == "__main__":
@@ -125,7 +132,7 @@ if __name__ == "__main__":
 
     agent = Agent(net, device=device)
     exp_source = experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA, steps_count=REWARD_STEPS_DEFAULT)
-    buffer = experience.ExperienceReplayBuffer(exp_source, buffer_size=REPLAY_SIZE)
+    buffer = experience.PrioritizedReplayBuffer(exp_source, REPLAY_SIZE, PRIO_REPLAY_ALPHA)
 
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
 
@@ -134,9 +141,11 @@ if __name__ == "__main__":
         while True:
             frame_idx += 1
             buffer.populate(1)
+            beta = min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
             new_rewards = exp_source.pop_total_rewards()
             if new_rewards:
+                writer.add_scalar("beta", beta, frame_idx)
                 if reward_tracker.reward(new_rewards[0], frame_idx):
                     break
 
@@ -144,12 +153,12 @@ if __name__ == "__main__":
                 continue
 
             optimizer.zero_grad()
-            batch = buffer.sample(BATCH_SIZE)
-            loss_v = calc_loss_dqn(batch, net, tgt_net, gamma=GAMMA**REWARD_STEPS_DEFAULT,
-                                    device=device, double=DOUBLE_DQN)
+            batch, batch_indices, batch_weights = buffer.sample(BATCH_SIZE, beta)
+            loss_v, sample_prios_v = calc_loss(batch, batch_weights, net, tgt_net,
+                                               gamma=GAMMA**REWARD_STEPS_DEFAULT, device=device, double=DOUBLE_DQN)
             loss_v.backward()
             optimizer.step()
+            buffer.update_priorities(batch_indices, sample_prios_v.data.cpu().numpy())
 
             if frame_idx % SYNC_TARGET_FRAMES == 0:
                 tgt_net.load_state_dict(net.state_dict())
-    
