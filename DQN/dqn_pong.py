@@ -15,13 +15,13 @@ import wrappers
 import dqn_model
 from agent import Agent
 import experience
+import utils
 
 
 DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
 STOP_REWARD = 19.5
 
 REWARD_STEPS_DEFAULT = 2  # number of steps to unroll Bellman
-DOUBLE_DQN = True
 
 PRIO_REPLAY_ALPHA = 0.6
 BETA_START = 0.4
@@ -33,6 +33,11 @@ LEARNING_RATE = 1e-4
 REPLAY_SIZE = 100_000
 REPLAY_START_SIZE = 10000
 SYNC_TARGET_FRAMES = 1000
+
+Vmax = 10
+Vmin = -10
+N_ATOMS = 51
+DELTA_Z = (Vmax - Vmin) / (N_ATOMS - 1)
 
 
 class RewardTracker:
@@ -60,9 +65,6 @@ class RewardTracker:
         self.writer.add_scalar("speed", speed, frame)
         self.writer.add_scalar("reward_100", mean_reward, frame)
         self.writer.add_scalar("reward", reward, frame)
-        if frame % 500 == 0:
-            for layer_idx, sigma_l2 in enumerate(net.noisy_layers_sigma_snr()):
-                writer.add_scalar(f"sigma_snr_layer_{layer_idx+1}", sigma_l2, frame)
         if self.best_reward is None:
             self.best_reward = mean_reward
         if mean_reward > self.best_reward:
@@ -74,43 +76,42 @@ class RewardTracker:
         return False
 
 
-def unpack_batch(batch):
-    states, actions, rewards, dones, last_states = [], [], [], [], []
-    for exp in batch:
-        state = np.array(exp.state, copy=False)
-        states.append(state)
-        actions.append(exp.action)
-        rewards.append(exp.reward)
-        dones.append(exp.last_state is None)
-        if exp.last_state is None:
-            last_states.append(state)       # the result will be masked anyway
-        else:
-            last_states.append(np.array(exp.last_state, copy=False))
-    return np.array(states, copy=False), np.array(actions), np.array(rewards, dtype=np.float32), \
-           np.array(dones, dtype=bool), np.array(last_states, copy=False)
+def calc_loss(batch, batch_weights, net, tgt_net, gamma, device="cpu"):
+    states, actions, rewards, dones, next_states = utils.unpack_batch(batch)
+    batch_size = len(batch)
 
-
-def calc_loss(batch, batch_weights, net, tgt_net, gamma, device="cpu", double=True):
-    states, actions, rewards, dones, next_states = unpack_batch(batch)
-
-    states_v = torch.tensor(states, dtype=torch.float).to(device)
-    next_states_v = torch.tensor(next_states).to(device)
+    states_v = torch.tensor(states).to(device)
     actions_v = torch.tensor(actions).to(device)
-    rewards_v = torch.tensor(rewards).to(device)
-    done_mask = torch.tensor(dones, dtype=torch.bool).to(device)
+    next_states_v = torch.tensor(next_states).to(device)
     batch_weights_v = torch.tensor(batch_weights).to(device)
 
-    state_action_values = net(states_v).gather(1, actions_v.unsqueeze(-1)).squeeze(-1)
-    if double:
-        next_state_actions = net(next_states_v).max(1)[1]
-        next_state_values = tgt_net(next_states_v).gather(1, next_state_actions.unsqueeze(-1)).squeeze(1)
-    else:
-        next_state_values = tgt_net(next_states_v).max(1)[0]
-    next_state_values[done_mask] = 0.0
+    # next state distribution
+    # dueling arch -- actions from main net, distr from tgt_net
 
-    expected_state_action_values = next_state_values.detach() * gamma + rewards_v
-    losses_v = batch_weights_v * (state_action_values - expected_state_action_values) ** 2
-    return losses_v.mean(), losses_v + 1e-5
+    # calc at once both next and cur states
+    distr_v, qvals_v = net.both(torch.cat((states_v, next_states_v)))
+    next_qvals_v = qvals_v[batch_size:]
+    distr_v = distr_v[:batch_size]
+
+    next_actions_v = next_qvals_v.max(1)[1]
+    next_distr_v = tgt_net(next_states_v)
+    next_best_distr_v = next_distr_v[range(batch_size), next_actions_v.data]
+    next_best_distr_v = tgt_net.apply_softmax(next_best_distr_v)
+    next_best_distr = next_best_distr_v.data.cpu().numpy()
+ 
+    dones = dones.astype(np.bool)
+
+    # project our distribution using Bellman update
+    proj_distr = utils.distr_projection(next_best_distr, rewards, dones, Vmin, Vmax, N_ATOMS, gamma)
+
+    # calculate net output
+    state_action_values = distr_v[range(batch_size), actions_v.data]
+    state_log_sm_v = F.log_softmax(state_action_values, dim=1)
+    proj_distr_v = torch.tensor(proj_distr).to(device)
+
+    loss_v = -state_log_sm_v * proj_distr_v
+    loss_v = batch_weights_v * loss_v.sum(dim=1)
+    return loss_v.mean(), loss_v + 1e-5
 
 
 if __name__ == "__main__":
@@ -123,14 +124,14 @@ if __name__ == "__main__":
     env = gym.make(DEFAULT_ENV_NAME)
     env = wrappers.wrap_dqn(env)
 
-    net = dqn_model.NoisyDQN(env.observation_space.shape, env.action_space.n).to(device)
-    tgt_net = dqn_model.NoisyDQN(env.observation_space.shape, env.action_space.n).to(device)
+    net = dqn_model.RainbowDQN(env.observation_space.shape, env.action_space.n).to(device)
+    tgt_net = dqn_model.RainbowDQN(env.observation_space.shape, env.action_space.n).to(device)
 
     date_time = datetime.datetime.now().strftime('%d-%b-%Y_%X_%f')
     run_name = f'{DEFAULT_ENV_NAME}_{date_time}'
     writer = SummaryWriter('runs/' + run_name)
 
-    agent = Agent(net, device=device)
+    agent = Agent(lambda x: net.qvals(x), device=device)
     exp_source = experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA, steps_count=REWARD_STEPS_DEFAULT)
     buffer = experience.PrioritizedReplayBuffer(exp_source, REPLAY_SIZE, PRIO_REPLAY_ALPHA)
 
@@ -155,7 +156,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             batch, batch_indices, batch_weights = buffer.sample(BATCH_SIZE, beta)
             loss_v, sample_prios_v = calc_loss(batch, batch_weights, net, tgt_net,
-                                               gamma=GAMMA**REWARD_STEPS_DEFAULT, device=device, double=DOUBLE_DQN)
+                                               gamma=GAMMA**REWARD_STEPS_DEFAULT, device=device)
             loss_v.backward()
             optimizer.step()
             buffer.update_priorities(batch_indices, sample_prios_v.data.cpu().numpy())

@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from dqn_pong import N_ATOMS, Vmin, Vmax, DELTA_Z
+
 
 class NoisyFactorizedLinear(nn.Linear):
     """
@@ -35,7 +37,7 @@ class NoisyFactorizedLinear(nn.Linear):
         return F.linear(input, self.weight + self.sigma_weight * noise_v, bias)
 
 
-class NoisyDQN(nn.Module):
+class RainbowDQN(nn.Module):
     def __init__(self, input_shape, n_actions):
         super().__init__()
 
@@ -49,27 +51,41 @@ class NoisyDQN(nn.Module):
         )
 
         conv_out_size = self._get_conv_out(input_shape)
-        self.noisy_layers = [
+        self.fc_adv = nn.Sequential(
             NoisyFactorizedLinear(conv_out_size, 512),
-            NoisyFactorizedLinear(512, n_actions)
-        ]
-        self.fc = nn.Sequential(
-            self.noisy_layers[0],
             nn.ReLU(),
-            self.noisy_layers[1]
+            NoisyFactorizedLinear(512, n_actions * N_ATOMS)
         )
+        self.fc_val = nn.Sequential(
+            NoisyFactorizedLinear(conv_out_size, 512),
+            nn.ReLU(),
+            NoisyFactorizedLinear(512, N_ATOMS)
+        )
+
+        self.register_buffer("supports", torch.arange(Vmin, Vmax+DELTA_Z, DELTA_Z))
 
     def _get_conv_out(self, shape):
         o = self.conv(torch.zeros(1, *shape))
         return int(np.prod(o.size()))
 
     def forward(self, x):
+        batch_size = x.shape[0]
         fx = x.float() / 256
-        conv_out = self.conv(fx).view(fx.shape[0], -1)
-        return self.fc(conv_out)
+        conv_out = self.conv(fx).view(batch_size, -1)
+        val = self.fc_val(conv_out).view(batch_size, 1, N_ATOMS)
+        adv = self.fc_adv(conv_out).view(batch_size, -1, N_ATOMS)
+        adv_mean = adv.mean(dim=1, keepdim=True)
+        return val + adv - adv_mean
 
-    def noisy_layers_sigma_snr(self):
-        return [
-            ((layer.weight ** 2).mean().sqrt() / (layer.sigma_weight ** 2).mean().sqrt()).item()
-            for layer in self.noisy_layers
-        ]
+    def both(self, x):
+        cat_out = self(x)
+        probs = self.apply_softmax(cat_out)
+        weights = probs * self.supports
+        res = weights.sum(dim=2)
+        return cat_out, res
+
+    def qvals(self, x):
+        return self.both(x)[1]
+
+    def apply_softmax(self, t):
+        return F.softmax(t.view(-1, N_ATOMS), dim=1).view(t.size())
