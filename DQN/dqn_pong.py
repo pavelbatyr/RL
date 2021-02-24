@@ -2,6 +2,7 @@ import argparse
 import time
 import collections
 import datetime
+import os
 
 import numpy as np
 import torch
@@ -21,28 +22,27 @@ import utils
 DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
 STOP_REWARD = 19.5
 
-REWARD_STEPS_DEFAULT = 2  # number of steps to unroll Bellman
+N_STEPS = 2  # number of steps to unroll Bellman
 
 PRIO_REPLAY_ALPHA = 0.6
 BETA_START = 0.4
 BETA_FRAMES = 100_000
 
-GAMMA = 0.99
+N_QUANTILES = 100  # distributional; QR-DQN
+
+GAMMA = 0.99  # discounting factor
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
+ADAM_EPS = 0.01 / 32
 REPLAY_SIZE = 100_000
 REPLAY_START_SIZE = 10000
 SYNC_TARGET_FRAMES = 1000
 
-Vmax = 10
-Vmin = -10
-N_ATOMS = 51
-DELTA_Z = (Vmax - Vmin) / (N_ATOMS - 1)
-
 
 class RewardTracker:
-    def __init__(self, writer, net, run_name):
+    def __init__(self, writer, net, run_name, cp_dir):
         self.writer = writer
+        self.cp_dir = cp_dir
         self.best_reward = None
 
     def __enter__(self):
@@ -69,49 +69,57 @@ class RewardTracker:
             self.best_reward = mean_reward
         if mean_reward > self.best_reward:
             self.best_reward = mean_reward
-            torch.save(net.state_dict(), run_name + "-best.pt")
+            torch.save(net.state_dict(), self.cp_dir + run_name + "-best.pt")
         if mean_reward > STOP_REWARD:
             print("Solved in %d frames!" % frame)
             return True
         return False
 
 
-def calc_loss(batch, batch_weights, net, tgt_net, gamma, device="cpu"):
+def calc_loss(batch, batch_weights, net, tgt_net, gamma, quantile_tau, device="cpu"):
     states, actions, rewards, dones, next_states = utils.unpack_batch(batch)
     batch_size = len(batch)
 
-    states_v = torch.tensor(states).to(device)
-    actions_v = torch.tensor(actions).to(device)
-    next_states_v = torch.tensor(next_states).to(device)
-    batch_weights_v = torch.tensor(batch_weights).to(device)
+    states = torch.tensor(states).to(device)
+    actions = torch.tensor(actions).to(device)
+    rewards = torch.tensor(rewards).to(device)
+    next_states = torch.tensor(next_states).to(device)
+    batch_weights = torch.tensor(batch_weights).to(device)
 
-    # next state distribution
-    # dueling arch -- actions from main net, distr from tgt_net
+    qvals = net(torch.cat((states, next_states)))
+    qvals_cur = qvals[:batch_size]
+    qvals_next = qvals[batch_size:]
 
-    # calc at once both next and cur states
-    distr_v, qvals_v = net.both(torch.cat((states_v, next_states_v)))
-    next_qvals_v = qvals_v[batch_size:]
-    distr_v = distr_v[:batch_size]
+    qvals_tgt_next = tgt_net(next_states)
 
-    next_actions_v = next_qvals_v.max(1)[1]
-    next_distr_v = tgt_net(next_states_v)
-    next_best_distr_v = next_distr_v[range(batch_size), next_actions_v.data]
-    next_best_distr_v = tgt_net.apply_softmax(next_best_distr_v)
-    next_best_distr = next_best_distr_v.data.cpu().numpy()
- 
-    dones = dones.astype(np.bool)
+    max_actions_next = torch.argmax(qvals_next.mean(2), 1)
+    max_actions_next_expanded = max_actions_next.view(-1, 1, 1).expand(-1, 1, N_QUANTILES)
 
-    # project our distribution using Bellman update
-    proj_distr = utils.distr_projection(next_best_distr, rewards, dones, Vmin, Vmax, N_ATOMS, gamma)
+    q_targets = qvals_tgt_next.gather(1, max_actions_next_expanded)
+    q_targets[dones] = 0.0
+    q_targets = q_targets * GAMMA ** N_STEPS + rewards.view(-1, 1, 1)
+    assert q_targets.shape == (batch_size, 1, N_QUANTILES)
 
-    # calculate net output
-    state_action_values = distr_v[range(batch_size), actions_v.data]
-    state_log_sm_v = F.log_softmax(state_action_values, dim=1)
-    proj_distr_v = torch.tensor(proj_distr).to(device)
+    actions_expanded = actions.view(-1, 1, 1).expand(-1, 1, N_QUANTILES)
+    q_pred = qvals_cur.gather(1, actions_expanded).transpose(1, 2)
+    assert q_pred.shape == (batch_size, N_QUANTILES, 1)
 
-    loss_v = -state_log_sm_v * proj_distr_v
-    loss_v = batch_weights_v * loss_v.sum(dim=1)
-    return loss_v.mean(), loss_v + 1e-5
+    td_errors = q_targets - q_pred
+    assert td_errors.shape == (batch_size, N_QUANTILES, N_QUANTILES)
+
+    K = 1
+    ks = torch.full_like(td_errors, K)
+    td_errors_abs = td_errors.abs()
+    huber_loss = torch.where(td_errors_abs <= ks,
+                             0.5 * td_errors ** 2,
+                             ks * (td_errors_abs - 0.5 * ks))
+
+    deltas = quantile_tau.view(1, 1, -1) - (td_errors.detach() < 0).float()
+    quantile_loss = abs(deltas) * huber_loss / K
+    assert quantile_loss.shape == (batch_size, N_QUANTILES, N_QUANTILES)
+
+    loss = quantile_loss.sum(dim=1).mean(dim=1)
+    return loss.mean(), loss + 1e-5
 
 
 if __name__ == "__main__":
@@ -121,6 +129,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = torch.device("cuda")
 
+    cp_dir = 'checkpoints/'
+    runs_dir = 'runs/'
+    os.makedirs(cp_dir, exist_ok=True)
+    os.makedirs(runs_dir, exist_ok=True)
+
     env = gym.make(DEFAULT_ENV_NAME)
     env = wrappers.wrap_dqn(env)
 
@@ -129,13 +142,16 @@ if __name__ == "__main__":
 
     date_time = datetime.datetime.now().strftime('%d-%b-%Y_%X_%f')
     run_name = f'{DEFAULT_ENV_NAME}_{date_time}'
-    writer = SummaryWriter('runs/' + run_name)
+    writer = SummaryWriter(runs_dir + run_name)
 
-    agent = Agent(lambda x: net.qvals(x), device=device)
-    exp_source = experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA, steps_count=REWARD_STEPS_DEFAULT)
+    quantile_tau = [i / N_QUANTILES for i in range(1, N_QUANTILES+1)]
+    quantile_tau = torch.tensor(quantile_tau).to(device)
+
+    agent = Agent(net, device=device)
+    exp_source = experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA, steps_count=N_STEPS)
     buffer = experience.PrioritizedReplayBuffer(exp_source, REPLAY_SIZE, PRIO_REPLAY_ALPHA)
 
-    optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
     frame_idx = 0
     with RewardTracker(writer, net, run_name) as reward_tracker:
@@ -156,7 +172,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             batch, batch_indices, batch_weights = buffer.sample(BATCH_SIZE, beta)
             loss_v, sample_prios_v = calc_loss(batch, batch_weights, net, tgt_net,
-                                               gamma=GAMMA**REWARD_STEPS_DEFAULT, device=device)
+                                               gamma=GAMMA**N_STEPS, quantile_tau=quantile_tau, device=device)
             loss_v.backward()
             optimizer.step()
             buffer.update_priorities(batch_indices, sample_prios_v.data.cpu().numpy())

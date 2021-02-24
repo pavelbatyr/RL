@@ -42,9 +42,9 @@ class Agent:
                 states = states.to(self.device)
 
         q_v = self.dqn_model(states)
-        q_scores = q_v.data.cpu().numpy()
+        q_v = q_v.mean(2)  # average quantiles
+        q_scores = q_v.cpu().numpy()
 
-        batch_size, n_actions = q_scores.shape
         # greedy action selection
         actions = np.argmax(q_scores, axis=1)
 

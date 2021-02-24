@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from dqn_pong import N_ATOMS, Vmin, Vmax, DELTA_Z
+from dqn_pong import N_QUANTILES
 
 
 class NoisyFactorizedLinear(nn.Linear):
@@ -22,13 +22,15 @@ class NoisyFactorizedLinear(nn.Linear):
         if bias:
             self.sigma_bias = nn.Parameter(torch.full((out_features,), sigma_init))
 
+    def _sqrt_with_sign(self, x):
+        return torch.sign(x) * torch.sqrt(torch.abs(x))
+
     def forward(self, input):
         self.epsilon_input.normal_()
         self.epsilon_output.normal_()
 
-        func = lambda x: torch.sign(x) * torch.sqrt(torch.abs(x))
-        eps_in = func(self.epsilon_input.data)
-        eps_out = func(self.epsilon_output.data)
+        eps_in = self._sqrt_with_sign(self.epsilon_input.data)
+        eps_out = self._sqrt_with_sign(self.epsilon_output.data)
 
         bias = self.bias
         if bias is not None:
@@ -50,21 +52,21 @@ class RainbowDQN(nn.Module):
             nn.ReLU()
         )
 
-        conv_out_size = self._get_conv_out(input_shape)
-        self.fc_adv = nn.Sequential(
-            NoisyFactorizedLinear(conv_out_size, 512),
-            nn.ReLU(),
-            NoisyFactorizedLinear(512, n_actions * N_ATOMS)
-        )
+        conv_out_size = self._conv_out_size(input_shape)
+        
+        # saparate branches for state value and advantages of actions
         self.fc_val = nn.Sequential(
             NoisyFactorizedLinear(conv_out_size, 512),
             nn.ReLU(),
-            NoisyFactorizedLinear(512, N_ATOMS)
+            NoisyFactorizedLinear(512, N_QUANTILES)
+        )
+        self.fc_adv = nn.Sequential(
+            NoisyFactorizedLinear(conv_out_size, 512),
+            nn.ReLU(),
+            NoisyFactorizedLinear(512, n_actions * N_QUANTILES)
         )
 
-        self.register_buffer("supports", torch.arange(Vmin, Vmax+DELTA_Z, DELTA_Z))
-
-    def _get_conv_out(self, shape):
+    def _conv_out_size(self, shape):
         o = self.conv(torch.zeros(1, *shape))
         return int(np.prod(o.size()))
 
@@ -72,20 +74,7 @@ class RainbowDQN(nn.Module):
         batch_size = x.shape[0]
         fx = x.float() / 256
         conv_out = self.conv(fx).view(batch_size, -1)
-        val = self.fc_val(conv_out).view(batch_size, 1, N_ATOMS)
-        adv = self.fc_adv(conv_out).view(batch_size, -1, N_ATOMS)
+        val = self.fc_val(conv_out).view(batch_size, 1, N_QUANTILES)
+        adv = self.fc_adv(conv_out).view(batch_size, -1, N_QUANTILES)
         adv_mean = adv.mean(dim=1, keepdim=True)
         return val + adv - adv_mean
-
-    def both(self, x):
-        cat_out = self(x)
-        probs = self.apply_softmax(cat_out)
-        weights = probs * self.supports
-        res = weights.sum(dim=2)
-        return cat_out, res
-
-    def qvals(self, x):
-        return self.both(x)[1]
-
-    def apply_softmax(self, t):
-        return F.softmax(t.view(-1, N_ATOMS), dim=1).view(t.size())
