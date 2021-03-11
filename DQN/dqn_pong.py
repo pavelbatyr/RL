@@ -3,6 +3,7 @@ import time
 import collections
 import datetime
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -28,7 +29,12 @@ PRIO_REPLAY_ALPHA = 0.6
 BETA_START = 0.4
 BETA_FRAMES = 100_000
 
-N_QUANTILES = 100  # distributional; QR-DQN
+# IQN params:
+N = 64
+N_dash = 64
+K = 32
+NUM_COSINES = 64
+KAPPA = 1.0  # for Huber loss
 
 GAMMA = 0.99  # discounting factor
 BATCH_SIZE = 32
@@ -42,7 +48,7 @@ SYNC_TARGET_FRAMES = 1000
 class RewardTracker:
     def __init__(self, writer, net, run_name, cp_dir):
         self.writer = writer
-        self.cp_dir = cp_dir
+        self.save_path = str(cp_dir / f'{run_name}-best.pt')
         self.best_reward = None
 
     def __enter__(self):
@@ -69,57 +75,62 @@ class RewardTracker:
             self.best_reward = mean_reward
         if mean_reward > self.best_reward:
             self.best_reward = mean_reward
-            torch.save(net.state_dict(), self.cp_dir + run_name + "-best.pt")
+            torch.save(net.state_dict(), self.save_path)
         if mean_reward > STOP_REWARD:
             print("Solved in %d frames!" % frame)
             return True
         return False
 
 
-def calc_loss(batch, batch_weights, net, tgt_net, gamma, quantile_tau, device="cpu"):
+def calc_loss(batch, batch_weights, net, tgt_net, gamma, device="cpu"):
     states, actions, rewards, dones, next_states = utils.unpack_batch(batch)
     batch_size = len(batch)
 
-    states = torch.tensor(states).to(device)
-    actions = torch.tensor(actions).to(device)
-    rewards = torch.tensor(rewards).to(device)
-    next_states = torch.tensor(next_states).to(device)
-    batch_weights = torch.tensor(batch_weights).to(device)
+    states = torch.tensor(states, device=device)
+    actions = torch.tensor(actions, device=device)
+    dones = torch.tensor(dones, device=device)
+    rewards = torch.tensor(rewards, device=device)
+    next_states = torch.tensor(next_states, device=device)
+    batch_weights = torch.tensor(batch_weights, device=device)
 
-    qvals = net(torch.cat((states, next_states)))
-    qvals_cur = qvals[:batch_size]
-    qvals_next = qvals[batch_size:]
+    state_embeddings = net.calculate_state_embeddings(states)
 
-    qvals_tgt_next = tgt_net(next_states)
+    taus = torch.rand(
+        batch_size, N, dtype=state_embeddings.dtype,
+        device=device)
 
-    max_actions_next = torch.argmax(qvals_next.mean(2), 1)
-    max_actions_next_expanded = max_actions_next.view(-1, 1, 1).expand(-1, 1, N_QUANTILES)
+    current_sa_quantiles = utils.evaluate_quantile_at_action(
+        net.calculate_quantiles(taus, state_embeddings=state_embeddings),
+        actions.unsqueeze(-1))
+    assert current_sa_quantiles.shape == (batch_size, N, 1)
 
-    q_targets = qvals_tgt_next.gather(1, max_actions_next_expanded)
-    q_targets[dones] = 0.0
-    q_targets = q_targets * GAMMA ** N_STEPS + rewards.view(-1, 1, 1)
-    assert q_targets.shape == (batch_size, 1, N_QUANTILES)
+    with torch.no_grad():
+        net.sample_noise()
+        next_q = net.calculate_q(states=next_states)
+        next_actions = torch.argmax(next_q, dim=1, keepdim=True)
+        assert next_actions.shape == (batch_size, 1)
 
-    actions_expanded = actions.view(-1, 1, 1).expand(-1, 1, N_QUANTILES)
-    q_pred = qvals_cur.gather(1, actions_expanded).transpose(1, 2)
-    assert q_pred.shape == (batch_size, N_QUANTILES, 1)
+        next_state_embeddings = tgt_net.calculate_state_embeddings(next_states)
 
-    td_errors = q_targets - q_pred
-    assert td_errors.shape == (batch_size, N_QUANTILES, N_QUANTILES)
+        tau_dashes = torch.rand(
+            batch_size, N_dash, dtype=state_embeddings.dtype,
+            device=device)
 
-    K = 1
-    ks = torch.full_like(td_errors, K)
-    td_errors_abs = td_errors.abs()
-    huber_loss = torch.where(td_errors_abs <= ks,
-                             0.5 * td_errors ** 2,
-                             ks * (td_errors_abs - 0.5 * ks))
+        next_sa_quantiles = utils.evaluate_quantile_at_action(
+            tgt_net.calculate_quantiles(tau_dashes, state_embeddings=next_state_embeddings), 
+            next_actions).transpose(1, 2)
+        assert next_sa_quantiles.shape == (batch_size, 1, N_dash)
 
-    deltas = quantile_tau.view(1, 1, -1) - (td_errors.detach() < 0).float()
-    quantile_loss = abs(deltas) * huber_loss / K
-    assert quantile_loss.shape == (batch_size, N_QUANTILES, N_QUANTILES)
+        target_sa_quantiles = rewards.view(-1, 1, 1) + (
+            1.0 - dones.view(-1, 1, 1)) * gamma * next_sa_quantiles
+        assert target_sa_quantiles.shape == (batch_size, 1, N_dash)
 
-    loss = quantile_loss.sum(dim=1).mean(dim=1)
-    return loss.mean(), loss + 1e-5
+    td_errors = target_sa_quantiles - current_sa_quantiles
+    assert td_errors.shape == (batch_size, N, N_dash)
+
+    loss, losses = utils.calculate_quantile_huber_loss(td_errors, taus, KAPPA)
+    # TODO td_errors-based priority?
+    return loss, losses
 
 
 if __name__ == "__main__":
@@ -129,32 +140,36 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = torch.device("cuda")
 
-    cp_dir = 'checkpoints/'
-    runs_dir = 'runs/'
-    os.makedirs(cp_dir, exist_ok=True)
-    os.makedirs(runs_dir, exist_ok=True)
-
-    env = gym.make(DEFAULT_ENV_NAME)
-    env = wrappers.wrap_dqn(env)
-
-    net = dqn_model.RainbowDQN(env.observation_space.shape, env.action_space.n).to(device)
-    tgt_net = dqn_model.RainbowDQN(env.observation_space.shape, env.action_space.n).to(device)
+    project_dir = Path(__file__).resolve().parent
+    runs_dir = project_dir / 'runs'
+    cp_dir = project_dir / 'checkpoints'
+    os.makedirs(str(runs_dir), exist_ok=True)
+    os.makedirs(str(cp_dir), exist_ok=True)
 
     date_time = datetime.datetime.now().strftime('%d-%b-%Y_%X_%f')
     run_name = f'{DEFAULT_ENV_NAME}_{date_time}'
-    writer = SummaryWriter(runs_dir + run_name)
+    run_path = str(runs_dir / run_name)
+    writer = SummaryWriter(run_path)
+    
+    env = gym.make(DEFAULT_ENV_NAME)
+    env = wrappers.wrap_dqn(env)
 
-    quantile_tau = [i / N_QUANTILES for i in range(1, N_QUANTILES+1)]
-    quantile_tau = torch.tensor(quantile_tau).to(device)
+    net = dqn_model.RainbowIQN(num_channels=env.observation_space.shape[0],
+                               num_actions=env.action_space.n
+                               ).to(device)
+    tgt_net = dqn_model.RainbowIQN(num_channels=env.observation_space.shape[0],
+                                   num_actions=env.action_space.n
+                                   ).to(device)
 
     agent = Agent(net, device=device)
     exp_source = experience.ExperienceSourceFirstLast(env, agent, gamma=GAMMA, steps_count=N_STEPS)
-    buffer = experience.PrioritizedReplayBuffer(exp_source, REPLAY_SIZE, PRIO_REPLAY_ALPHA)
+    buffer = experience.PrioritizedReplayBuffer(exp_source, REPLAY_SIZE, PRIO_REPLAY_ALPHA)  # TODO tree implementation
 
+    # TODO eps schedule
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
     frame_idx = 0
-    with RewardTracker(writer, net, run_name) as reward_tracker:
+    with RewardTracker(writer, net, run_name, cp_dir) as reward_tracker:
         while True:
             frame_idx += 1
             buffer.populate(1)
@@ -172,7 +187,8 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             batch, batch_indices, batch_weights = buffer.sample(BATCH_SIZE, beta)
             loss_v, sample_prios_v = calc_loss(batch, batch_weights, net, tgt_net,
-                                               gamma=GAMMA**N_STEPS, quantile_tau=quantile_tau, device=device)
+                                               gamma=GAMMA**N_STEPS, device=device)
+
             loss_v.backward()
             optimizer.step()
             buffer.update_priorities(batch_indices, sample_prios_v.data.cpu().numpy())

@@ -11,7 +11,7 @@ def default_states_preprocessor(states):
     if len(states) == 1:
         np_states = np.expand_dims(states[0], 0)
     else:
-        np_states = np.array(exp_list, dtype=np.float32)
+        np_states = np.array(states, dtype=np.float32)
     return torch.tensor(np_states, dtype=torch.float)
 
 
@@ -41,11 +41,10 @@ class Agent:
             if torch.is_tensor(states):
                 states = states.to(self.device)
 
-        q_v = self.dqn_model(states)
-        q_v = q_v.mean(2)  # average quantiles
-        q_scores = q_v.cpu().numpy()
-
-        # greedy action selection
-        actions = np.argmax(q_scores, axis=1)
+        with torch.no_grad():
+            q_vals = self.dqn_model.calculate_q(states=states)
+            # greedy action selection
+            actions = torch.argmax(q_vals, dim=1)
+            actions = actions.cpu().numpy()
 
         return actions, agent_states
