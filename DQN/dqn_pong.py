@@ -30,8 +30,6 @@ BETA_START = 0.4
 BETA_FRAMES = 100_000
 
 # IQN params:
-N = 64
-N_dash = 64
 K = 32
 NUM_COSINES = 64
 KAPPA = 1.0  # for Huber loss
@@ -82,7 +80,7 @@ class RewardTracker:
         return False
 
 
-def calc_loss(batch, batch_weights, net, tgt_net, gamma, device="cpu"):
+def calc_loss(batch, batch_weights, net, tgt_net, N, N_dash, gamma, device="cpu"):
     states, actions, rewards, dones, next_states = utils.unpack_batch(batch)
     batch_size = len(batch)
 
@@ -168,12 +166,21 @@ if __name__ == "__main__":
     # TODO eps schedule
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
+    N_EXP_START = 6  # 2^6 = 64
+    N_EXP_END = 3  # 2^3 = 8
+    ns = [2**x for x in range(N_EXP_START-1, N_EXP_END-1, -1)]
+    n = n_dash = 2**N_EXP_START
+    STEP_FRAMES_N = 50000
+
     frame_idx = 0
     with RewardTracker(writer, net, run_name, cp_dir) as reward_tracker:
         while True:
             frame_idx += 1
             buffer.populate(1)
             beta = min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
+            if frame_idx % STEP_FRAMES_N == 0 and ns:
+                n = n_dash = ns[0]
+                del ns[0]
 
             new_rewards = exp_source.pop_total_rewards()
             if new_rewards:
@@ -186,7 +193,7 @@ if __name__ == "__main__":
 
             optimizer.zero_grad()
             batch, batch_indices, batch_weights = buffer.sample(BATCH_SIZE, beta)
-            loss_v, sample_prios_v = calc_loss(batch, batch_weights, net, tgt_net,
+            loss_v, sample_prios_v = calc_loss(batch, batch_weights, net, tgt_net, n, n_dash,
                                                gamma=GAMMA**N_STEPS, device=device)
 
             loss_v.backward()
